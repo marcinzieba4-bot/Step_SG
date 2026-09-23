@@ -9,7 +9,9 @@ Strikes are set from VXN, and implied vols come from the [VolVue](https://volvue
 * `Adjusted VXN = VXN(prev close) * sqrt(bdays / 252)`: VXN rescaled to the option's own tenor.
 * `Adj. vol % = 2.5 * Adjusted VXN` and `Target moneyness = 100% - Adj. vol %`. Strikes widen automatically when VXN is high.
 * Trades are executed at an approximate full-day TWAP: Black-Scholes at `(O+H+L+C)/4` with the day's interpolated VolVue ATM IV plus a parametric put skew, less costs.
-* Positions are held to expiry and cash-settled at the close. The ladder is sized so that about 1x NAV of put notional is outstanding, and collateral earns T-bills.
+* Positions are held to expiry and cash-settled at the close. At full size, the ladder keeps about 1x NAV of put notional outstanding.
+* **Low-VXN size cut:** size is scaled by a multiplier that is 0.25 at VXN <= 15, 1.0 at VXN >= 20, and linear in between (`Params.size_cut`, `cut_vxn_low`, `cut_vxn_full`, `cut_floor`).
+* **Money market:** margin follows the CBOE short index put rule. Unused capital earns the money-market rate (13w T-bill - 10 bp, `mm_fee`), and margin earns `collateral_rate_mult` x T-bill (default 0).
 
 ## Run
 

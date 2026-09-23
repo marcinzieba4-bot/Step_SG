@@ -80,8 +80,8 @@ def charts(res, cash_ret, ex_ret, df):
     cash_nav = (1 + cash_ret).cumprod()
     ex_nav = (1 + ex_ret).cumprod()
     ax.plot(nav.index, nav, color=C1, label="Short-put ladder (total return)")
-    ax.plot(ex_nav.index, ex_nav, color=C2, label="Option overlay only (excess of cash)")
-    ax.plot(cash_nav.index, cash_nav, color=C3, label="T-bill collateral")
+    ax.plot(ex_nav.index, ex_nav, color=C2, label="Option overlay only (excluding interest)")
+    ax.plot(cash_nav.index, cash_nav, color=C3, label="Interest only (money market + collateral)")
     for s, lab in ((nav, "total"), (ex_nav, "overlay"), (cash_nav, "cash")):
         ax.annotate(f"{s.iloc[-1]:.2f}x", (s.index[-1], s.iloc[-1]), xytext=(4, 0),
                     textcoords="offset points", va="center", color=INK2, fontsize=8.5)
@@ -139,7 +139,16 @@ def charts(res, cash_ret, ex_ret, df):
     ax.set_title("Daily return distribution: small steady gains, fat left tail")
     fig.tight_layout(); fig.savefig(OUT / "return_distribution.png", dpi=140); plt.close(fig)
 
-    # 6) Exposure: $delta and $gamma per 1% move
+    # 6) Size cut and capital usage (two panels, one axis each)
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
+    a1.plot(d.index, d["size_mult"].rolling(5).mean(), color=C1, linewidth=1)
+    a1.set_ylim(0, 1.05)
+    a1.set_title("Low-VXN size multiplier (5d avg; 1.0 = full size)")
+    a2.plot(d.index, d["unused_cash"].rolling(5).mean() * 100, color=C3, linewidth=1)
+    a2.set_title("Unused capital earning the money-market rate (% of NAV, 5d avg)")
+    fig.tight_layout(); fig.savefig(OUT / "size_cut_cash.png", dpi=140); plt.close(fig)
+
+    # 7) Exposure: $delta and $gamma per 1% move
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
     a1.plot(d.index, d["delta"] * 100, color=C1, linewidth=0.8)
     a1.set_title("Net delta (% of NAV per 100% NDX move; i.e. equity-equivalent exposure)")
@@ -205,7 +214,12 @@ def main():
     # ---------------- sensitivities
     sens_rows = []
     variants = [
-        ("Base: 2.5x, skew 0.12, 1x", base),
+        ("Base: 2.5x, skew 0.12, 1x, cut 15-20, MM", base),
+        ("No low-VXN size cut", replace(base, size_cut=False)),
+        ("Size cut ramp 14-18", replace(base, cut_vxn_low=14.0, cut_vxn_full=18.0)),
+        ("Size cut floor 0 (stop below VXN 15)", replace(base, cut_floor=0.0)),
+        ("Collateral also earns T-bill", replace(base, collateral_rate_mult=1.0)),
+        ("No interest at all (pure overlay)", replace(base, include_cash=False)),
         ("Multiplier 2.0x", replace(base, sigma_mult=2.0)),
         ("Multiplier 3.0x", replace(base, sigma_mult=3.0)),
         ("No skew (flat ATM vol)", replace(base, skew_beta=0.0)),
@@ -234,6 +248,35 @@ def main():
 
     signal = next_day_signal(df, base)
 
+    # ---------------- size cut & cash usage
+    d_reg = d.assign(regime=d["vxn"].shift(1).apply(risk.regime_of))
+    cut_tbl = d_reg.groupby("regime").agg(
+        days=("ret", "size"), size_mult=("size_mult", "mean"),
+        margin=("margin_used", "mean"), unused=("unused_cash", "mean"),
+        mm=("mm_interest", "mean"), ret=("ret", "mean"),
+    ).reindex([n for _, _, n in risk.VXN_REGIMES]).dropna(how="all")
+    cut_tbl = pd.DataFrame({
+        "% of days": (cut_tbl["days"] / len(d)).map(pct),
+        "Avg size multiplier": cut_tbl["size_mult"].map(lambda v: f"{v:.2f}"),
+        "Margin used (% NAV)": cut_tbl["margin"].map(lambda v: pct(v, 1)),
+        "Unused in money market (% NAV)": cut_tbl["unused"].map(lambda v: pct(v, 1)),
+        "MM interest (ann.)": (cut_tbl["mm"] * 252).map(pct),
+        "Total return (ann., arith.)": (cut_tbl["ret"] * 252).map(pct),
+    })
+    cut_tbl.index.name = "VXN regime"
+    yrs = len(d) / 252
+    cash_tbl = pd.Series({
+        "Money-market interest on unused capital (ann.)": pct(d["mm_interest"].sum() / yrs),
+        "Interest on margin collateral (ann.)": pct(d["coll_interest"].sum() / yrs),
+        "Option overlay P&L (ann., arith.)": pct(ex_ret.sum() / yrs),
+        "Avg margin used (% NAV)": pct(d["margin_used"].mean(), 1),
+        "Peak margin used (% NAV)": pct(d["margin_used"].max(), 1),
+        "Avg unused capital in money market (% NAV)": pct(d["unused_cash"].mean(), 1),
+        "Avg size multiplier": f"{d['size_mult'].mean():.2f}",
+        "% of days with a size cut": pct((d["size_mult"] < 1).mean(), 1),
+    }, name="Value").to_frame()
+    cash_tbl.index.name = "Return source / capital usage"
+
     # ---------------- outputs
     charts(res, cash_ret, ex_ret, df)
     d.to_csv(OUT / "daily.csv")
@@ -243,7 +286,8 @@ def main():
     proxy_days = (df.loc[args.start:, "vxn_src"] != "CBOE").sum()
     sig_tbl = signal.set_index("expiry")[[
         "expiry_day", "bdays", "adj_vxn_pct", "adj_vol_pct", "target_moneyness_pct",
-        "strike", "model_iv_pct", "est_premium_pts", "est_premium_bps", "delta"]]
+        "strike", "model_iv_pct", "est_premium_pts", "est_premium_bps", "delta",
+        "size_mult", "notional_pct_nav"]]
 
     report = f"""# NDX short-put ladder: systematic 1-5 day put selling
 
@@ -258,8 +302,12 @@ Data: VolVue API (NDX implied vols), CBOE VXN, Yahoo (NDX OHLC, 13w T-bill).
   When VXN rises, strikes automatically move further out-of-the-money (the volatility-regime adjustment).
 * Executed at the **full-day TWAP**, approximated as Black-Scholes at spot (O+H+L+C)/4 and the average of the previous and current day's
   VolVue 10-day ATM put IV, with a parametric put skew (IV x (1 + {base.skew_beta} x SDs OTM), cap {base.skew_cap}x). Cost: {base.tc_pct_premium:.0%} of premium, min {base.tc_min_points} pts.
-* Held to expiry, cash-settled at the close. Each (day, expiry) tranche sells notional = NAV x {base.leverage} / {base.tranche_divisor:.0f},
-  so about {base.leverage:.0%} of NAV is outstanding on average; collateral earns the T-bill rate.
+* Held to expiry, cash-settled at the close. Each (day, expiry) tranche sells notional = NAV x {base.leverage} x size multiplier / {base.tranche_divisor:.0f},
+  so at full size about {base.leverage:.0%} of NAV is outstanding on average.
+* **Low-VXN size cut:** the size multiplier is {base.cut_floor} when VXN(prev close) <= {base.cut_vxn_low:.0f}, 1.0 when VXN >= {base.cut_vxn_full:.0f}, linear in between.
+  At low VXN the strikes are close to spot and the premium barely covers costs, so exposure is cut there.
+* **Cash:** margin is modelled with the CBOE short index put rule (option value + max({base.margin_pct_spot:.0%} x S - OTM amount, {base.margin_min_pct_strike:.0%} x K)).
+  Capital tied up as margin earns {base.collateral_rate_mult:.0%} of the T-bill rate. **Unused capital earns the money-market rate** (13w T-bill - {base.mm_fee * 1e4:.0f} bp fee).
 
 ## Headline risk statistics
 
@@ -267,6 +315,14 @@ Data: VolVue API (NDX implied vols), CBOE VXN, Yahoo (NDX OHLC, 13w T-bill).
 
 ![Equity curve](equity_curve.png)
 ![Drawdown](drawdown.png)
+
+## Low-VXN size cut and money-market cash
+
+{md_table(cash_tbl)}
+
+{md_table(cut_tbl)}
+
+![Size cut and cash](size_cut_cash.png)
 
 ## Trade statistics
 
@@ -316,7 +372,9 @@ The strike is computed off the last close; recompute against the live TWAP level
 * VXN before the CBOE CSV history (and on {proxy_days} days in this sample) uses VolVue NDX 30d mean IV x {df.attrs.get('vxn_proxy_ratio', float('nan')):.3f}.
   {df.attrs.get('atm_vol_cleaned_days', 0)} bad VolVue ATM IV prints were replaced by VXN x rolling median ratio.
 * TWAP uses (O+H+L+C)/4 and interpolated IV. Intraday path, early-close days and settlement-price nuances are ignored.
-* No margin model: the 1x version is fully cash-secured on average, but a day with several expiries can briefly exceed 1x notional.
+* Margin uses the CBOE minimum for short broad-index puts. A broker may charge more (house margin), which leaves less capital in the money market.
+  The money-market rate is proxied by the 13w T-bill (^IRX) minus a fee.
+* The size-cut thresholds (15/20) were chosen after looking at P&L by VXN bucket, so they are in-sample. The sensitivity rows show that nearby choices behave similarly.
 """
     (OUT / "report.md").write_text(report)
     print(report)

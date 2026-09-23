@@ -1,4 +1,4 @@
-trade_date,expiry,expiry_day,bdays,vxn,adj_vxn_pct,adj_vol_pct,target_moneyness_pct,ref_spot,strike,model_iv_pct,est_premium_pts,est_premium_bps,delta
-2026-09-23,2026-09-25,Friday,2,20.18,1.798,4.494,95.51,30723.71,29340.0,22.66,4.95,1.61,-0.0194
-2026-09-23,2026-09-28,Monday,3,20.18,2.202,5.505,94.5,30723.71,29030.0,22.88,4.94,1.61,-0.0165
-2026-09-23,2026-09-30,Wednesday,5,20.18,2.843,7.106,92.89,30723.71,28540.0,23.1,5.21,1.7,-0.014
+trade_date,expiry,expiry_day,bdays,vxn,adj_vxn_pct,adj_vol_pct,target_moneyness_pct,ref_spot,strike,model_iv_pct,est_premium_pts,est_premium_bps,delta,size_mult,notional_pct_nav
+2026-09-23,2026-09-25,Friday,2,20.18,1.798,4.494,95.51,30723.71,29340.0,22.66,4.95,1.61,-0.0194,1.0,11.11
+2026-09-23,2026-09-28,Monday,3,20.18,2.202,5.505,94.5,30723.71,29030.0,22.88,4.94,1.61,-0.0165,1.0,11.11
+2026-09-23,2026-09-30,Wednesday,5,20.18,2.843,7.106,92.89,30723.71,28540.0,23.1,5.21,1.7,-0.014,1.0,11.11
