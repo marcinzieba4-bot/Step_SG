@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# downloaded market data (VolVue data is licensed, do not commit)
+cache/
+# large generated files
+output/daily.csv
+output/trades.csv
