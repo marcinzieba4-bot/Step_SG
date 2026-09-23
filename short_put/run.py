@@ -2,7 +2,11 @@
 
 Usage:
     export VOLVUE_API_KEY=...
-    python -m short_put.run [--start 2005-01-03] [--refresh]
+    python -m short_put.run [--start 2005-01-03] [--refresh] [--venue ibkr_qqq] [--nav 1000000]
+
+--venue picks the execution/cash model for the headline results
+(generic | ibkr_qqq | ibkr_ndxp | gs_ndxp | gs_qqq); --nav sizes the
+next-day orders in contracts.
 
 Outputs go to ``output/``: report.md, charts (*.png) and CSVs.
 """
@@ -22,6 +26,7 @@ import pandas as pd  # noqa: E402
 
 from . import risk  # noqa: E402
 from .data import load_all  # noqa: E402
+from .costs import IBKR_CASH_BALANCE, VENUES, params_for  # noqa: E402
 from .strategy import Params, next_day_signal, run_backtest  # noqa: E402
 
 OUT = Path(__file__).resolve().parent.parent / "output"
@@ -35,7 +40,7 @@ def _style():
     plt.rcParams.update({
         "figure.facecolor": "#fcfcfb", "axes.facecolor": "#fcfcfb",
         "axes.edgecolor": GRID, "axes.labelcolor": INK2, "axes.titlecolor": INK,
-        "axes.titlesize": 12, "axes.titleweight": "semibold", "axes.titlelocation": "left",
+        "axes.titlesize": 12, "axes.titleweight": "bold", "axes.titlelocation": "left",
         "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
         "axes.spines.top": False, "axes.spines.right": False,
         "xtick.color": INK2, "ytick.color": INK2, "font.size": 9.5,
@@ -161,11 +166,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2005-01-03")
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--venue", default="ibkr_qqq", choices=["generic", *VENUES])
+    ap.add_argument("--nav", type=float, default=1_000_000.0)
+    ap.add_argument("--recent-start", default="2022-05-02", help="start of the 'current market structure' window")
     args = ap.parse_args()
     OUT.mkdir(exist_ok=True)
 
     df = load_all(refresh=args.refresh)
-    base = Params()
+    base = Params() if args.venue == "generic" else params_for(args.venue)
+    venue_label = "generic cost model (5% of premium, min 0.10 pt)" if base.venue is None else base.venue.name
     res = run_backtest(df, base, start=args.start)
     d = res.daily
     ret = d["ret"]
@@ -214,17 +223,21 @@ def main():
     # ---------------- sensitivities
     sens_rows = []
     variants = [
-        ("Base: 2.5x, skew 0.12, 1x, cut 15-20, MM", base),
+        ("Base: 2.5x, skew 0.12, 1x, cut 15-20", base),
         ("No low-VXN size cut", replace(base, size_cut=False)),
         ("Size cut ramp 14-18", replace(base, cut_vxn_low=14.0, cut_vxn_full=18.0)),
         ("Size cut floor 0 (stop below VXN 15)", replace(base, cut_floor=0.0)),
-        ("Collateral also earns T-bill", replace(base, collateral_rate_mult=1.0)),
+        ("Margin collateral earns nothing", replace(base, collateral_rate_mult=0.0)),
         ("No interest at all (pure overlay)", replace(base, include_cash=False)),
         ("Multiplier 2.0x", replace(base, sigma_mult=2.0)),
         ("Multiplier 3.0x", replace(base, sigma_mult=3.0)),
         ("No skew (flat ATM vol)", replace(base, skew_beta=0.0)),
         ("Steeper skew 0.20", replace(base, skew_beta=0.20)),
-        ("Double t-costs", replace(base, tc_pct_premium=0.10, tc_min_points=0.20)),
+        ("Double t-costs", replace(base, tc_pct_premium=0.10, tc_min_points=0.20) if base.venue is None else
+         replace(base, venue=replace(base.venue, pay_frac=min(1.0, 2 * base.venue.pay_frac),
+                                     fee_per_contract=2 * base.venue.fee_per_contract))),
+        ("Sell on the bid (pay full half-spread)", base if base.venue is None else
+         replace(base, venue=replace(base.venue, pay_frac=1.0))),
         ("Leverage 2x", replace(base, leverage=2.0)),
         ("Leverage 3x", replace(base, leverage=3.0)),
     ]
@@ -246,7 +259,72 @@ def main():
         print(f"  ran {name}")
     sens = pd.DataFrame(sens_rows).set_index("Variant")
 
-    signal = next_day_signal(df, base)
+    signal = next_day_signal(df, base, nav=args.nav)
+
+    # ---------------- execution venues
+    venue_cases = [("Generic model (old: 5% of premium)", Params())]
+    venue_cases += [(v.name, params_for(k)) for k, v in VENUES.items()]
+    venue_cases += [("IBKR private - QQQ, cash left at IBKR (BM - 0.5%)", params_for("ibkr_qqq", **IBKR_CASH_BALANCE))]
+    vrows = []
+    for name, p in venue_cases:
+        row = {"Setup": name}
+        for label, st in (("full", args.start), ("recent", args.recent_start)):
+            r = res if (p == base and st == args.start) else run_backtest(df, p, start=st)
+            rr = r.daily["ret"]
+            s_ = risk.perf_stats(rr, rf)
+            e_ = risk.perf_stats(rr - r.daily["interest"], None)
+            t = r.trades
+            if label == "full":
+                row.update({"CAGR": pct(s_["CAGR"]), "Overlay CAGR": pct(e_["CAGR"]), "Sharpe": f"{s_['Sharpe (vs T-bill)']:.2f}"})
+            else:
+                cost_share = (t["price_mid"] - t["fill"]).sum() / t["price_mid"].sum()
+                row.update({f"CAGR since {st[:4]}": pct(s_["CAGR"]), f"Overlay since {st[:4]}": pct(e_["CAGR"]),
+                            f"Sharpe since {st[:4]}": f"{s_['Sharpe (vs T-bill)']:.2f}",
+                            f"Cost % of premium since {st[:4]}": pct(cost_share, 1)})
+        vrows.append(row)
+        print(f"  ran venue {name}")
+    venue_tbl = pd.DataFrame(vrows).set_index("Setup")
+
+    spot_now = df["close"].iloc[-1]
+    size_rows = []
+    for k, v in VENUES.items():
+        cn = v.contract_notional(spot_now)
+        per_tranche_full = base.leverage / base.tranche_divisor
+        size_rows.append({
+            "Instrument": f"{v.instrument} ({k.split('_')[0].upper()})",
+            "Contract notional": f"${cn:,.0f}",
+            "Min NAV, 1 contract per tranche at full size": f"${cn / per_tranche_full:,.0f}",
+            "Min NAV, 1 contract at the 0.25x size-cut floor": f"${cn / (per_tranche_full * base.cut_floor):,.0f}",
+        })
+    size_tbl = pd.DataFrame(size_rows).drop_duplicates("Instrument").set_index("Instrument")
+
+    # market check of the premium/spread assumptions at tomorrow's strikes
+    try:
+        from .liquidity import load_chain, quotes_near
+        ndx_ch, qqq_ch = load_chain("_NDX"), load_chain("QQQ")
+        ratio = qqq_ch["spot"].iloc[0] / ndx_ch["spot"].iloc[0]
+        chk = []
+        for _, sgl in next_day_signal(df, Params()).iterrows():
+            n_ = quotes_near(ndx_ch, "NDXP", sgl["expiry"], sgl["strike"], width=0)
+            q_ = quotes_near(qqq_ch, "QQQ", sgl["expiry"], np.floor(sgl["strike"] * ratio), width=0)
+            if n_.empty or q_.empty:
+                continue
+            n_, q_ = n_.iloc[0], q_.iloc[0]
+            chk.append({
+                "Expiry": sgl["expiry"], "Model premium (NDX pts)": f"{sgl['est_premium_pts']:.2f}",
+                "Model cost, generic 5%": f"{max(0.05 * sgl['est_premium_pts'], 0.10):.2f}",
+                "NDXP strike": f"{n_['strike']:.0f}",
+                "NDXP bid / ask": f"{n_['bid']:.2f} / {n_['ask']:.2f}",
+                "NDXP half-spread % mid": pct(n_["half_pct_mid"], 0),
+                "QQQ strike": f"{q_['strike']:.0f}",
+                "QQQ bid / ask": f"{q_['bid']:.2f} / {q_['ask']:.2f}",
+                "QQQ mid in NDX pts": f"{q_['mid'] / ratio:.2f}",
+                "QQQ half-spread % mid": pct(q_["half_pct_mid"], 0),
+            })
+        mkt_tbl = pd.DataFrame(chk).set_index("Expiry")
+        mkt_asof = str(ndx_ch["asof"].iloc[0])
+    except Exception as exc:  # network / format issues should not kill the report
+        mkt_tbl, mkt_asof = pd.DataFrame({"note": [f"Cboe chain unavailable: {exc}"]}), "n/a"
 
     # ---------------- size cut & cash usage
     d_reg = d.assign(regime=d["vxn"].shift(1).apply(risk.regime_of))
@@ -284,15 +362,17 @@ def main():
     signal.to_csv(OUT / "next_day_signal.csv", index=False)
 
     proxy_days = (df.loc[args.start:, "vxn_src"] != "CBOE").sum()
-    sig_tbl = signal.set_index("expiry")[[
-        "expiry_day", "bdays", "adj_vxn_pct", "adj_vol_pct", "target_moneyness_pct",
-        "strike", "model_iv_pct", "est_premium_pts", "est_premium_bps", "delta",
-        "size_mult", "notional_pct_nav"]]
+    sig_cols = ["expiry_day", "bdays", "adj_vxn_pct", "adj_vol_pct", "target_moneyness_pct",
+                "strike", "model_iv_pct", "est_premium_pts", "est_premium_bps", "delta",
+                "size_mult", "notional_pct_nav"]
+    sig_cols += [c for c in ("instrument", "instrument_strike", "contracts", "est_cost_pts_ndx") if c in signal]
+    sig_tbl = signal.set_index("expiry")[sig_cols]
 
     report = f"""# NDX short-put ladder: systematic 1-5 day put selling
 
 Backtest {d.index[0].date()} to {d.index[-1].date()} ({len(d):,} trading days, {len(res.trades):,} puts sold).
-Data: VolVue API (NDX implied vols), CBOE VXN, Yahoo (NDX OHLC, 13w T-bill).
+Data: VolVue API (NDX implied vols), CBOE VXN, Yahoo (NDX OHLC, 13w T-bill), Cboe delayed option chains (spread calibration).
+**Headline execution and cash model: {venue_label}.**
 
 ## Rules
 
@@ -301,13 +381,14 @@ Data: VolVue API (NDX implied vols), CBOE VXN, Yahoo (NDX OHLC, 13w T-bill).
 * **Adj. vol %** = {base.sigma_mult} x Adjusted VXN; **target moneyness** = 100% - Adj. vol %; strike rounded down to a {base.strike_step:.0f}-pt grid.
   When VXN rises, strikes automatically move further out-of-the-money (the volatility-regime adjustment).
 * Executed at the **full-day TWAP**, approximated as Black-Scholes at spot (O+H+L+C)/4 and the average of the previous and current day's
-  VolVue 10-day ATM put IV, with a parametric put skew (IV x (1 + {base.skew_beta} x SDs OTM), cap {base.skew_cap}x). Cost: {base.tc_pct_premium:.0%} of premium, min {base.tc_min_points} pts.
+  VolVue 10-day ATM put IV, with a parametric put skew (IV x (1 + {base.skew_beta} x SDs OTM), cap {base.skew_cap}x).
+  Costs follow the venue model below (quoted half-spread fitted on Cboe chains x share paid, plus per-contract fees).
 * Held to expiry, cash-settled at the close. Each (day, expiry) tranche sells notional = NAV x {base.leverage} x size multiplier / {base.tranche_divisor:.0f},
   so at full size about {base.leverage:.0%} of NAV is outstanding on average.
 * **Low-VXN size cut:** the size multiplier is {base.cut_floor} when VXN(prev close) <= {base.cut_vxn_low:.0f}, 1.0 when VXN >= {base.cut_vxn_full:.0f}, linear in between.
   At low VXN the strikes are close to spot and the premium barely covers costs, so exposure is cut there.
 * **Cash:** margin is modelled with the CBOE short index put rule (option value + max({base.margin_pct_spot:.0%} x S - OTM amount, {base.margin_min_pct_strike:.0%} x K)).
-  Capital tied up as margin earns {base.collateral_rate_mult:.0%} of the T-bill rate. **Unused capital earns the money-market rate** (13w T-bill - {base.mm_fee * 1e4:.0f} bp fee).
+  Margin collateral earns {base.collateral_rate_mult:.0%} x (T-bill - {base.collateral_fee * 1e4:.0f} bp). **Unused capital earns the money-market rate** (13w T-bill - {base.mm_fee * 1e4:.0f} bp).
 
 ## Headline risk statistics
 
@@ -353,13 +434,44 @@ Data: VolVue API (NDX implied vols), CBOE VXN, Yahoo (NDX OHLC, 13w T-bill).
 ![Rolling](rolling.png)
 ![Distribution](return_distribution.png)
 
+## Execution venues: are the bid/ask assumptions realistic?
+
+**Market check at tomorrow's strikes** (Cboe end-of-day quotes, {mkt_asof}):
+
+{md_table(mkt_tbl)}
+
+End-of-day quotes are wider than during the session, especially for NDXP, which quotes until 16:15 ET, so these spreads are an upper bound for a TWAP.
+The quotes are from the previous close, so they have one more session to run than a trade placed tomorrow midday. That is why "QQQ mid in NDX pts"
+tends to exceed "Model premium". On the 2026-09-22 calibration day, repricing the model on the same horizon put it 23% above the market for the
+nearest expiry and 16-89% below for the other two. Market IV about 3 SDs out-of-the-money was 1.3-1.4x ATM, versus 1.36x in the model. So the premium
+model looks roughly right to conservative, while real quoted spreads are wider than the old generic 5% rule.
+
+**Venue cost and cash models** (per option: share of the fitted quoted half-spread paid + per-contract fees; cash in T-bills unless stated):
+
+| Setup | Instrument | Share of half-spread paid | Fees per contract | Cash drag vs T-bill |
+|---|---|---|---|---|
+""" + "\n".join(
+        f"| {v.name} | {v.instrument} | {v.pay_frac:.0%} | ${v.fee_per_contract:.2f} | {params_for(k).mm_fee * 1e4:.0f} bp |"
+        for k, v in VENUES.items()) + f"""
+
+{md_table(venue_tbl)}
+
+The full-history columns apply today's cost structure (spreads in bps of spot, today's fees) to the whole period. The columns from 2022 onward,
+when daily NDXP expiries existed, are the better guide to live trading costs. Sharpe differences across setups also reflect the cash terms:
+the venue setups hold margin in T-bills, while the generic model's margin earns nothing.
+
+**Minimum account size** (tranche = {base.leverage / base.tranche_divisor:.1%} of NAV at full size; contracts are whole numbers):
+
+{md_table(size_tbl)}
+
 ## Sensitivity to design choices and model assumptions
 
 {md_table(sens)}
 
 ## Next trading day: trades to place
 
-Based on the {d.index[-1].date()} close (NDX {df['close'].iloc[-1]:,.2f}, VXN {df['vxn'].iloc[-1]:.2f}, NDX 10d ATM put IV {df['atm_vol'].iloc[-1]:.2f}).
+Based on the {d.index[-1].date()} close (NDX {df['close'].iloc[-1]:,.2f}, VXN {df['vxn'].iloc[-1]:.2f}, NDX 10d ATM put IV {df['atm_vol'].iloc[-1]:.2f}),
+sized for NAV ${args.nav:,.0f} with {venue_label}.
 The strike is computed off the last close; recompute against the live TWAP level when executing.
 
 {md_table(sig_tbl)}

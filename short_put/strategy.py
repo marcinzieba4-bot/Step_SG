@@ -30,12 +30,14 @@ VXN the strikes sit close to spot and premia barely cover costs, so exposure is
 reduced and the freed capital sits in the money market instead.
 
 Cash: the capital tied up as margin (CBOE short index put rule: option value +
-max(15% x S - OTM amount, 10% x K)) earns ``collateral_rate_mult`` x T-bill.
+max(15% x S - OTM amount, 10% x K)) earns ``collateral_rate_mult`` x (T-bill - ``collateral_fee``).
 Unused capital (NAV - margin) earns the money-market rate = T-bill - ``mm_fee``.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from .costs import Venue
 
 import numpy as np
 import pandas as pd
@@ -53,8 +55,9 @@ class Params:
     skew_cap: float = 2.0            # max IV multiple of ATM
     div_yield: float = 0.008         # NDX dividend yield
     strike_step: float = 10.0        # NDX strike grid (index points)
-    tc_pct_premium: float = 0.05     # bid/ask cost as % of premium
-    tc_min_points: float = 0.10      # minimum cost per option (index points)
+    tc_pct_premium: float = 0.05     # generic cost as % of premium (used when venue is None)
+    tc_min_points: float = 0.10      # generic minimum cost per option (index points)
+    venue: Venue | None = None       # venue-specific spread + fee model (costs.py)
     min_premium: float = 0.05        # skip trades below this premium (points)
     tranche_divisor: float = 9.0     # avg sum of bdays to expiry across the 3 expiries
     # low-VXN size cut
@@ -65,7 +68,8 @@ class Params:
     # cash management
     include_cash: bool = True        # False -> no interest at all (pure overlay)
     mm_fee: float = 0.0010           # money-market rate = T-bill - fee (floored at 0)
-    collateral_rate_mult: float = 0.0  # share of T-bill earned on margin (0 = none)
+    collateral_rate_mult: float = 0.0  # share of (T-bill - collateral_fee) earned on margin (0 = none)
+    collateral_fee: float = 0.0        # spread below T-bill earned on margin collateral
     margin_pct_spot: float = 0.15    # CBOE broad-index short put margin parameters
     margin_min_pct_strike: float = 0.10
 
@@ -139,6 +143,13 @@ def size_multiplier(vxn_prev: float, p: Params) -> float:
     return float(p.cut_floor + (1.0 - p.cut_floor) * np.clip(w, 0.0, 1.0))
 
 
+def trade_cost(premium_pts: float, spot: float, p: Params) -> float:
+    """Execution cost per option in index points."""
+    if p.venue is not None:
+        return p.venue.cost_points(premium_pts, spot)
+    return max(p.tc_pct_premium * premium_pts, p.tc_min_points)
+
+
 def margin_requirement(S: float, K: float, option_value: float, p: Params) -> float:
     """CBOE-style margin per unit for a short broad-index put."""
     otm = max(S - K, 0.0)
@@ -191,7 +202,8 @@ def run_backtest(df: pd.DataFrame, p: Params | None = None, start: str | None = 
         used = min(margin_used, max(nav_prev, 0.0))
         unused = max(nav_prev - used, 0.0)
         mm_interest = unused * max(rf[i - 1] - p.mm_fee, 0.0) * dt if p.include_cash else 0.0
-        coll_interest = used * rf[i - 1] * p.collateral_rate_mult * dt if p.include_cash else 0.0
+        coll_rate = max(rf[i - 1] - p.collateral_fee, 0.0) * p.collateral_rate_mult
+        coll_interest = used * coll_rate * dt if p.include_cash else 0.0
         interest = mm_interest + coll_interest
         cash += interest
 
@@ -206,7 +218,7 @@ def run_backtest(df: pd.DataFrame, p: Params | None = None, start: str | None = 
             px = float(bs_put(twap[i], K, T, vol_k, rf[i], q))
             if px < p.min_premium:
                 continue
-            cost = max(p.tc_pct_premium * px, p.tc_min_points)
+            cost = trade_cost(px, twap[i], p)
             fill = px - cost
             if fill <= 0:
                 continue
@@ -270,8 +282,13 @@ def run_backtest(df: pd.DataFrame, p: Params | None = None, start: str | None = 
     return Result(nav=nav_s, daily=daily_df, trades=trades_df, open_positions=open_df, params=p)
 
 
-def next_day_signal(df: pd.DataFrame, p: Params | None = None) -> pd.DataFrame:
-    """Trades to execute on the next trading day using the latest close data."""
+def next_day_signal(df: pd.DataFrame, p: Params | None = None, nav: float | None = None) -> pd.DataFrame:
+    """Trades to execute on the next trading day using the latest close data.
+
+    If ``p.venue`` is set, the strike is also expressed in the venue's instrument
+    (e.g. QQQ, $1 strike grid, rounded down) and, given ``nav`` in USD, the number
+    of contracts per expiry is computed (rounded to the nearest whole contract).
+    """
     p = p or Params()
     cal = extend_calendar(df.index)
     i = len(df.index)  # position of the next (not yet observed) trading day in `cal`
@@ -295,4 +312,14 @@ def next_day_signal(df: pd.DataFrame, p: Params | None = None) -> pd.DataFrame:
             size_mult=round(size_mult, 3),
             notional_pct_nav=round(100 * p.leverage * size_mult / p.tranche_divisor, 2),
         ))
+        if p.venue is not None:
+            v = p.venue
+            inst_spot = spot_ref * v.ndx_ratio
+            step = 1.0 if v.instrument == "QQQ" else p.strike_step
+            rows[-1]["instrument"] = v.instrument
+            rows[-1]["instrument_strike"] = float(np.floor(mny * inst_spot / step) * step)
+            rows[-1]["est_cost_pts_ndx"] = round(trade_cost(px, spot_ref, p), 3)
+            if nav:
+                notional = nav * p.leverage * size_mult / p.tranche_divisor
+                rows[-1]["contracts"] = int(round(notional / v.contract_notional(spot_ref)))
     return pd.DataFrame(rows)

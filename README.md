@@ -20,7 +20,20 @@ pip install -r requirements.txt
 export VOLVUE_API_KEY=...            # VolVue Premium API key
 python -m short_put.run              # full backtest + report -> output/report.md
 python -m short_put.run --refresh    # re-download data
+python -m short_put.run --venue gs_ndxp --nav 150000000   # institutional setup
+python -m short_put.liquidity        # pre-trade check: Cboe quotes at tomorrow's strikes + spread fit
 ```
+
+## Execution venues
+
+`short_put/costs.py` holds per-venue cost and cash models. Spreads are fitted on Cboe option chains; fees come from IBKR and Nasdaq PHLX schedules.
+
+| Key | Route | Notes |
+|---|---|---|
+| `ibkr_qqq` (default) | IBKR private, QQQ options | Penny-wide, liquid. About $75k per contract, so NAV of $0.7M or more is needed for 1 lot per tranche |
+| `ibkr_ndxp` | IBKR private, NDXP | About $3M per contract and wide quotes. Not practical below about $28M |
+| `gs_ndxp` | Goldman institutional, NDXP | Cash-settled and European, with no assignment risk. Needs NAV of about $110M or more for the size cut to work |
+| `gs_qqq` | Goldman institutional, QQQ | Cheapest route per unit of premium. Physical settlement |
 
 Use it programmatically:
 
@@ -40,6 +53,8 @@ print(next_day_signal(df))          # tomorrow's three strikes
 | `short_put/data.py` | VolVue API client (NDX IVs), CBOE VXN, Yahoo NDX OHLC and T-bill, cleaning and alignment |
 | `short_put/strategy.py` | Expiry calendar, strike rule, TWAP pricing, daily mark-to-model backtest, next-day signal |
 | `short_put/risk.py` | Performance and risk statistics, VXN-regime breakdown, stress episodes, NDX beta |
+| `short_put/costs.py` | Venue cost models (spread fit x share paid + per-contract fees) and cash terms |
+| `short_put/liquidity.py` | Cboe chain loader, quotes at tomorrow's strikes, spread calibration |
 | `short_put/run.py` | Runs everything and writes `output/report.md`, charts and CSVs |
 
 See `output/report.md` for the latest results and the modelling caveats.
