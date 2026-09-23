@@ -1,4 +1,8 @@
-"""Systematic short-put ladder on the Nasdaq-100 (NDX).
+"""Systematic short-put ladder on an equity index (S&P 500 or Nasdaq-100).
+
+The strike driver is the index's own volatility index: VIX for the S&P 500
+(SPX, traded via XSP / SPY options), VXN for the Nasdaq-100 (NDX). Below,
+"VIX" stands for whichever applies.
 
 Rules
 -----
@@ -8,15 +12,15 @@ Every trading day t:
    (holiday expiries roll to the previous trading day). Each is 1-5 business
    days away, e.g. on a Tuesday: Wed (1bd), Fri (3bd), next Mon (4bd).
 2. For each expiry with n business days to maturity:
-       Adjusted VXN  = VXN_{t-1} * sqrt(n / 252)      (VXN rescaled to the tenor)
-       Adj. vol %    = 2.5 * Adjusted VXN              (2.5 "sigma" buffer)
+       Adjusted VIX  = VIX_{t-1} * sqrt(n / 252)      (VIX rescaled to the tenor)
+       Adj. vol %    = 2.5 * Adjusted VIX              (2.5 "sigma" buffer)
        Moneyness     = 100% - Adj. vol %
        Strike        = Moneyness * S_TWAP, rounded down to the strike grid
-   VXN of the previous close is used, so the strike is known before the open.
+   The previous close of the vol index is used, so the strike is known before the open.
 3. Sell the put at the full-day TWAP, approximated as the Black-Scholes price
    at S_TWAP = (O+H+L+C)/4 with the average of yesterday's and today's
-   implied vol (VolVue NDX 10d ATM put IV plus a parametric skew), minus a
-   transaction cost.
+   implied vol (VolVue 10d ATM put IV of the index plus a parametric skew),
+   minus a venue-specific transaction cost (costs.py).
 4. Hold to expiry, cash-settled against the closing level (PM settlement).
    Open positions are marked to model daily.
 
@@ -24,14 +28,15 @@ Sizing: each (day, expiry) tranche sells notional = NAV * leverage * size_mult /
 On average the three open expiries sum to ~9 business days, so the ladder
 keeps roughly ``leverage`` x NAV of put notional outstanding.
 
-Low-VXN size cut: ``size_mult`` ramps linearly from ``cut_floor`` (VXN_{t-1} at
-or below ``cut_vxn_low``) to 1.0 (VXN_{t-1} at or above ``cut_vxn_full``). At low
-VXN the strikes sit close to spot and premia barely cover costs, so exposure is
-reduced and the freed capital sits in the money market instead.
+Low-vol size cut: ``size_mult`` ramps linearly from ``cut_floor`` (VIX_{t-1} at
+or below ``cut_vol_low``) to 1.0 (VIX_{t-1} at or above ``cut_vol_full``). At low
+VIX the strikes sit close to spot and premia barely cover costs.
 
-Cash: the capital tied up as margin (CBOE short index put rule: option value +
-max(15% x S - OTM amount, 10% x K)) earns ``collateral_rate_mult`` x (T-bill - ``collateral_fee``).
-Unused capital (NAV - margin) earns the money-market rate = T-bill - ``mm_fee``.
+Returns are the option P&L only (``include_cash=False`` by default): no interest
+is credited on cash or collateral. Margin (CBOE short index put rule: option
+value + max(15% x S - OTM amount, 10% x K)) is tracked for reporting only.
+Setting ``include_cash=True`` credits T-bill - ``mm_fee`` on unused capital and
+``collateral_rate_mult`` x (T-bill - ``collateral_fee``) on margin.
 """
 from __future__ import annotations
 
@@ -49,24 +54,25 @@ EXPIRY_WEEKDAYS = (0, 2, 4)  # Mon, Wed, Fri
 
 @dataclass
 class Params:
-    sigma_mult: float = 2.5          # Adj. vol % = sigma_mult * Adjusted VXN
+    underlying: str = "SPX"          # SPX (vol index VIX) or NDX (vol index VXN)
+    sigma_mult: float = 2.5          # Adj. vol % = sigma_mult * Adjusted VIX
     leverage: float = 1.0            # average outstanding put notional / NAV
-    skew_beta: float = 0.12          # IV(z) = ATM * (1 + beta * z), z = sd's OTM
+    skew_beta: float = 0.15          # IV(z) = ATM * (1 + beta * z), z = sd's OTM
     skew_cap: float = 2.0            # max IV multiple of ATM
-    div_yield: float = 0.008         # NDX dividend yield
-    strike_step: float = 10.0        # NDX strike grid (index points)
+    div_yield: float = 0.013         # index dividend yield
+    strike_step: float = 5.0         # index strike grid (index points)
     tc_pct_premium: float = 0.05     # generic cost as % of premium (used when venue is None)
     tc_min_points: float = 0.10      # generic minimum cost per option (index points)
     venue: Venue | None = None       # venue-specific spread + fee model (costs.py)
     min_premium: float = 0.05        # skip trades below this premium (points)
     tranche_divisor: float = 9.0     # avg sum of bdays to expiry across the 3 expiries
-    # low-VXN size cut
+    # low-vol size cut (levels of the vol index, VIX for SPX)
     size_cut: bool = True
-    cut_vxn_low: float = 15.0        # at/below this VXN: size = cut_floor
-    cut_vxn_full: float = 20.0       # at/above this VXN: full size
+    cut_vol_low: float = 13.0        # at/below this level: size = cut_floor
+    cut_vol_full: float = 17.0       # at/above this level: full size
     cut_floor: float = 0.25
-    # cash management
-    include_cash: bool = True        # False -> no interest at all (pure overlay)
+    # cash management (off: returns are option P&L only)
+    include_cash: bool = False       # True -> credit money-market / collateral interest
     mm_fee: float = 0.0010           # money-market rate = T-bill - fee (floored at 0)
     collateral_rate_mult: float = 0.0  # share of (T-bill - collateral_fee) earned on margin (0 = none)
     collateral_fee: float = 0.0        # spread below T-bill earned on margin collateral
@@ -135,11 +141,23 @@ def expiries_for(t_pos: int, cal: pd.DatetimeIndex, n: int = 3, max_bd: int = 5)
     return out
 
 
-def size_multiplier(vxn_prev: float, p: Params) -> float:
-    """Low-VXN size cut: linear ramp from cut_floor to 1 between the two VXN levels."""
+# Per-underlying defaults. SPX skew calibrated on the 2026-09-22 XSP/SPY/SPXW chains
+# (market IV about 1.37-1.51x ATM at 2.5-3.5 SDs OTM), NDX on the NDXP/QQQ chains.
+UNDERLYING_DEFAULTS = {
+    "SPX": dict(div_yield=0.013, strike_step=5.0, skew_beta=0.15, cut_vol_low=13.0, cut_vol_full=17.0),
+    "NDX": dict(div_yield=0.008, strike_step=10.0, skew_beta=0.12, cut_vol_low=15.0, cut_vol_full=20.0),
+}
+
+
+def default_params(underlying: str = "SPX", **overrides) -> Params:
+    return Params(underlying=underlying, **{**UNDERLYING_DEFAULTS[underlying], **overrides})
+
+
+def size_multiplier(vol_prev: float, p: Params) -> float:
+    """Low-vol size cut: linear ramp from cut_floor to 1 between the two vol-index levels."""
     if not p.size_cut:
         return 1.0
-    w = (vxn_prev - p.cut_vxn_low) / max(p.cut_vxn_full - p.cut_vxn_low, 1e-9)
+    w = (vol_prev - p.cut_vol_low) / max(p.cut_vol_full - p.cut_vol_low, 1e-9)
     return float(p.cut_floor + (1.0 - p.cut_floor) * np.clip(w, 0.0, 1.0))
 
 
@@ -156,12 +174,12 @@ def margin_requirement(S: float, K: float, option_value: float, p: Params) -> fl
     return option_value + max(p.margin_pct_spot * S - otm, p.margin_min_pct_strike * K)
 
 
-def strike_for(vxn_prev: float, bdays: int, spot: float, p: Params):
-    adj_vxn = vxn_prev * np.sqrt(bdays / TRADING_DAYS)           # in vol points (%)
-    adj_vol_pct = p.sigma_mult * adj_vxn                           # e.g. 2.5 * 2.1 = 5.3%
+def strike_for(vol_prev: float, bdays: int, spot: float, p: Params):
+    adj_vix = vol_prev * np.sqrt(bdays / TRADING_DAYS)           # in vol points (%)
+    adj_vol_pct = p.sigma_mult * adj_vix                           # e.g. 2.5 * 1.6 = 4.0%
     moneyness = 1.0 - adj_vol_pct / 100.0
     strike = np.floor(moneyness * spot / p.strike_step) * p.strike_step
-    return adj_vxn, adj_vol_pct, moneyness, strike
+    return adj_vix, adj_vol_pct, moneyness, strike
 
 
 # --------------------------------------------------------------------------- backtest
@@ -183,7 +201,7 @@ def run_backtest(df: pd.DataFrame, p: Params | None = None, start: str | None = 
     S_close = df["close"].to_numpy()
     twap = ((df["open"] + df["high"] + df["low"] + df["close"]) / 4).to_numpy()
     iv = (df["atm_vol"] / 100).to_numpy()
-    vxn = df["vxn"].to_numpy()
+    vol_idx = df["vol_index"].to_numpy()
     rf = df["rf"].fillna(0).to_numpy()
     q = p.div_yield
 
@@ -207,12 +225,12 @@ def run_backtest(df: pd.DataFrame, p: Params | None = None, start: str | None = 
         interest = mm_interest + coll_interest
         cash += interest
 
-        # 2) new sales at today's TWAP, sized off yesterday's NAV and VXN
+        # 2) new sales at today's TWAP, sized off yesterday's NAV and vol index
         sigma_twap = 0.5 * (iv[i - 1] + iv[i])
-        size_mult = size_multiplier(vxn[i - 1], p)
+        size_mult = size_multiplier(vol_idx[i - 1], p)
         premium_today = 0.0
         for exp_pos, bd in expiries_for(i, cal):
-            adj_vxn, adj_vol, mny, K = strike_for(vxn[i - 1], bd, twap[i], p)
+            adj_vix, adj_vol, mny, K = strike_for(vol_idx[i - 1], bd, twap[i], p)
             T = (bd + 0.5) / TRADING_DAYS  # half of today's session + bd sessions
             vol_k = float(skewed_vol(sigma_twap, twap[i], K, T, p))
             px = float(bs_put(twap[i], K, T, vol_k, rf[i], q))
@@ -228,7 +246,7 @@ def run_backtest(df: pd.DataFrame, p: Params | None = None, start: str | None = 
             premium_today += units * fill
             pos = dict(
                 trade_date=t, expiry=cal[exp_pos], exp_pos=exp_pos, bdays=bd,
-                spot_twap=twap[i], vxn_prev=vxn[i - 1], adj_vxn=adj_vxn,
+                spot_twap=twap[i], vol_prev=vol_idx[i - 1], adj_vix=adj_vix,
                 adj_vol_pct=adj_vol, moneyness=mny, strike=K, iv=vol_k,
                 price_mid=px, fill=fill, units=units, notional=notional, size_mult=size_mult,
             )
@@ -270,7 +288,7 @@ def run_backtest(df: pd.DataFrame, p: Params | None = None, start: str | None = 
             premium=premium_today / nav_prev, payout=payout_today / nav_prev,
             n_open=len(positions), gross_notional=gross_notional / nav,
             delta=delta / nav, gamma_1pct=gamma / nav, vega_1pt=vega / nav,
-            vxn=vxn[i], atm_vol=iv[i] * 100, spot=S_close[i],
+            vol_index=vol_idx[i], atm_vol=iv[i] * 100, spot=S_close[i],
         ))
 
     daily_df = pd.DataFrame(daily).set_index("date")
@@ -286,26 +304,26 @@ def next_day_signal(df: pd.DataFrame, p: Params | None = None, nav: float | None
     """Trades to execute on the next trading day using the latest close data.
 
     If ``p.venue`` is set, the strike is also expressed in the venue's instrument
-    (e.g. QQQ, $1 strike grid, rounded down) and, given ``nav`` in USD, the number
-    of contracts per expiry is computed (rounded to the nearest whole contract).
+    (e.g. XSP or SPY, $1 strike grid, rounded down) and, given ``nav`` in USD, the
+    number of contracts per expiry is computed (rounded to the nearest whole contract).
     """
     p = p or Params()
     cal = extend_calendar(df.index)
     i = len(df.index)  # position of the next (not yet observed) trading day in `cal`
     last = df.iloc[-1]
     spot_ref = last["close"]  # TWAP unknown ex-ante: reference = last close
-    size_mult = size_multiplier(last["vxn"], p)
+    size_mult = size_multiplier(last["vol_index"], p)
     rows = []
     for exp_pos, bd in expiries_for(i, cal):
-        adj_vxn, adj_vol, mny, K = strike_for(last["vxn"], bd, spot_ref, p)
+        adj_vix, adj_vol, mny, K = strike_for(last["vol_index"], bd, spot_ref, p)
         T = (bd + 0.5) / TRADING_DAYS
         vol_k = float(skewed_vol(last["atm_vol"] / 100, spot_ref, K, T, p))
         px = float(bs_put(spot_ref, K, T, vol_k, last["rf"], p.div_yield))
         d, _, _ = bs_put_greeks(spot_ref, K, T, vol_k, last["rf"], p.div_yield)
         rows.append(dict(
             trade_date=cal[i].date(), expiry=cal[exp_pos].date(),
-            expiry_day=cal[exp_pos].day_name(), bdays=bd, vxn=last["vxn"],
-            adj_vxn_pct=round(adj_vxn, 3), adj_vol_pct=round(adj_vol, 3),
+            expiry_day=cal[exp_pos].day_name(), bdays=bd, vol_index=last["vol_index"],
+            adj_vix_pct=round(adj_vix, 3), adj_vol_pct=round(adj_vol, 3),
             target_moneyness_pct=round(mny * 100, 2), ref_spot=round(spot_ref, 2),
             strike=K, model_iv_pct=round(vol_k * 100, 2), est_premium_pts=round(px, 2),
             est_premium_bps=round(px / spot_ref * 1e4, 2), delta=round(float(d), 4),
@@ -314,11 +332,11 @@ def next_day_signal(df: pd.DataFrame, p: Params | None = None, nav: float | None
         ))
         if p.venue is not None:
             v = p.venue
-            inst_spot = spot_ref * v.ndx_ratio
-            step = 1.0 if v.instrument == "QQQ" else p.strike_step
+            inst_spot = spot_ref * v.spot_ratio
             rows[-1]["instrument"] = v.instrument
-            rows[-1]["instrument_strike"] = float(np.floor(mny * inst_spot / step) * step)
-            rows[-1]["est_cost_pts_ndx"] = round(trade_cost(px, spot_ref, p), 3)
+            rows[-1]["instrument_strike"] = float(np.floor(mny * inst_spot / v.strike_step) * v.strike_step)
+            rows[-1]["est_premium_instr"] = round(px * v.spot_ratio, 3)
+            rows[-1]["est_cost_instr"] = round(trade_cost(px, spot_ref, p) * v.spot_ratio, 3)
             if nav:
                 notional = nav * p.leverage * size_mult / p.tranche_divisor
                 rows[-1]["contracts"] = int(round(notional / v.contract_notional(spot_ref)))

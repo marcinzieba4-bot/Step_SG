@@ -6,7 +6,11 @@ import pandas as pd
 
 TD = 252
 
-VXN_REGIMES = [(0, 18, "Low (<18)"), (18, 25, "Normal (18-25)"), (25, 35, "Elevated (25-35)"), (35, 1e9, "Crisis (>35)")]
+# Vol-index regimes: VIX for SPX, VXN for NDX (VXN runs roughly 1.2-1.3x VIX)
+REGIMES = {
+    "VIX": [(0, 14, "Low (<14)"), (14, 20, "Normal (14-20)"), (20, 28, "Elevated (20-28)"), (28, 1e9, "Crisis (>28)")],
+    "VXN": [(0, 18, "Low (<18)"), (18, 25, "Normal (18-25)"), (25, 35, "Elevated (25-35)"), (35, 1e9, "Crisis (>35)")],
+}
 
 STRESS_WINDOWS = {
     "GFC (Sep-Nov 2008)": ("2008-09-01", "2008-11-30"),
@@ -23,9 +27,9 @@ STRESS_WINDOWS = {
 }
 
 
-def regime_of(vxn: float) -> str:
-    for lo, hi, name in VXN_REGIMES:
-        if lo <= vxn < hi:
+def regime_of(vol: float, index: str = "VIX") -> str:
+    for lo, hi, name in REGIMES[index]:
+        if lo <= vol < hi:
             return name
     return "n/a"
 
@@ -66,7 +70,7 @@ def perf_stats(ret: pd.Series, rf: pd.Series | None = None, label: str = "") -> 
         "End": ret.index[-1].date(),
         "CAGR": cagr,
         "Ann. volatility": vol,
-        "Sharpe (vs T-bill)": sharpe,
+        "Sharpe": sharpe,
         "Sortino": sortino,
         "Max drawdown": mdd,
         "Max DD peak": dd_start.date(),
@@ -113,13 +117,13 @@ def trade_stats(trades: pd.DataFrame) -> dict:
     }
 
 
-def regime_stats(daily: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
+def regime_stats(daily: pd.DataFrame, trades: pd.DataFrame, index: str = "VIX") -> pd.DataFrame:
     d = daily.copy()
-    d["regime"] = d["vxn"].shift(1).apply(regime_of)  # regime known at trade time
+    d["regime"] = d["vol_index"].shift(1).apply(regime_of, index=index)  # regime known at trade time
     t = trades.dropna(subset=["payoff"]).copy()
-    t["regime"] = t["vxn_prev"].apply(regime_of)
+    t["regime"] = t["vol_prev"].apply(regime_of, index=index)
     rows = []
-    for _, _, name in VXN_REGIMES:
+    for _, _, name in REGIMES[index]:
         r = d.loc[d["regime"] == name, "ret"]
         tt = t[t["regime"] == name]
         if not len(r):
@@ -151,7 +155,7 @@ def stress_table(ret: pd.Series, spot: pd.Series) -> pd.DataFrame:
             "Strategy": nav.iloc[-1] - 1,
             "Strategy max DD": (nav / nav.cummax().clip(lower=1) - 1).min(),
             "Worst day": r.min(),
-            "NDX": s.iloc[-1] / spot.loc[:a].iloc[-2] - 1 if len(spot.loc[:a]) > 1 else np.nan,
+            "Index": s.iloc[-1] / spot.loc[:a].iloc[-2] - 1 if len(spot.loc[:a]) > 1 else np.nan,
         })
     return pd.DataFrame(rows).set_index("Episode")
 
@@ -160,20 +164,20 @@ def calendar_returns(ret: pd.Series) -> pd.Series:
     return (1 + ret).groupby(ret.index.year).prod() - 1
 
 
-def ndx_beta(ret: pd.Series, spot: pd.Series) -> dict:
-    ndx = spot.pct_change().reindex(ret.index)
-    ok = ret.notna() & ndx.notna()
-    x, y = ndx[ok], ret[ok]
+def market_beta(ret: pd.Series, spot: pd.Series) -> dict:
+    idx_ret = spot.pct_change().reindex(ret.index)
+    ok = ret.notna() & idx_ret.notna()
+    x, y = idx_ret[ok], ret[ok]
     beta = np.cov(y, x)[0, 1] / x.var()
     down = x < 0
     beta_dn = np.cov(y[down], x[down])[0, 1] / x[down].var()
     beta_up = np.cov(y[~down], x[~down])[0, 1] / x[~down].var()
     big = x < x.quantile(0.02)
     return {
-        "Beta to NDX": beta,
-        "Correlation to NDX": np.corrcoef(y, x)[0, 1],
+        "Beta to index": beta,
+        "Correlation to index": np.corrcoef(y, x)[0, 1],
         "Down-market beta": beta_dn,
         "Up-market beta": beta_up,
-        "Avg return on NDX worst-2% days": y[big].mean(),
-        "Avg NDX on those days": x[big].mean(),
+        "Avg return on the index's worst-2% days": y[big].mean(),
+        "Avg index return on those days": x[big].mean(),
     }
