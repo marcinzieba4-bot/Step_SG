@@ -153,7 +153,7 @@ def charts(results: dict, df: pd.DataFrame, vol_name: str, und_name: str):
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
     a1.plot(d.index, d["size_mult"].rolling(5).mean(), color=C1, linewidth=1)
     a1.set_ylim(0, 1.05)
-    a1.set_title(f"Low-{vol_name} size multiplier (5d avg; 1.0 = full size)")
+    a1.set_title(f"Size multiplier: low-{vol_name} cut x term-structure filter (5d avg; 1.0 = full size)")
     a2.plot(d.index, d["margin_used"].rolling(5).mean() * 100, color=C3, linewidth=1)
     a2.set_title("Margin used (CBOE index rule, % of NAV, 5d avg)")
     fig.tight_layout(); fig.savefig(OUT / "size_cut_margin.png", dpi=140); plt.close(fig)
@@ -233,6 +233,17 @@ def main():
     }, name="Value").to_frame()
     exposure.index.name = f"Exposure as of {d.index[-1].date()} ({labels[args.venue]})"
 
+    # ---------------- managed vs unmanaged (primary venue)
+    unmanaged = run_backtest(df, replace(base, ts_threshold=0.0, stop_mult=0.0), start=args.start)
+    mgmt_cmp = pd.DataFrame({
+        "Managed (default)": fmt_stats(risk.perf_stats(d["ret"], None)),
+        "Unmanaged": fmt_stats(risk.perf_stats(unmanaged.daily["ret"], None)),
+        f"Managed, since {args.recent_start[:4]}": fmt_stats(risk.perf_stats(d["ret"].loc[args.recent_start:], None)),
+        f"Unmanaged, since {args.recent_start[:4]}": fmt_stats(risk.perf_stats(unmanaged.daily["ret"].loc[args.recent_start:], None)),
+    }).loc[["CAGR", "Ann. volatility", "Sharpe", "Max drawdown", "Worst day", "Worst month"]]
+    mgmt_cmp.index.name = labels[args.venue]
+    apr = {n: (1 + r.daily["ret"].loc["2025-03-25":"2025-04-08"]).prod() - 1 for n, r in (("Managed", res), ("Unmanaged", unmanaged))}
+
     # ---------------- low-vol size cut by regime
     d_reg = d.assign(regime=d["vol_index"].shift(1).apply(risk.regime_of, index=vol_name))
     cut = d_reg.groupby("regime").agg(
@@ -256,7 +267,12 @@ def main():
 
     # ---------------- sensitivities (primary venue)
     variants = [
-        (f"Base: 2.5x, skew {base.skew_beta}, 1x, cut {base.cut_vol_low:.0f}-{base.cut_vol_full:.0f}", base),
+        ("Base (managed default)", base),
+        ("Unmanaged (no term-structure filter, no stop-loss)", replace(base, ts_threshold=0.0, stop_mult=0.0)),
+        ("No term-structure filter", replace(base, ts_threshold=0.0)),
+        ("No stop-loss", replace(base, stop_mult=0.0)),
+        ("Stop-loss at 5x premium", replace(base, stop_mult=5.0)),
+        ("Term-structure threshold 1.00", replace(base, ts_threshold=1.0)),
         ("No low-vol size cut", replace(base, size_cut=False)),
         (f"Size cut ramp {base.cut_vol_low - 1:.0f}-{base.cut_vol_full - 1:.0f}",
          replace(base, cut_vol_low=base.cut_vol_low - 1, cut_vol_full=base.cut_vol_full - 1)),
@@ -276,13 +292,14 @@ def main():
     ]
     sens_rows = []
     for name, p in variants:
-        r = res if p is base else (nocut if name == "No low-vol size cut" else run_backtest(df, p, start=args.start))
+        reuse = {"No low-vol size cut": nocut, "Unmanaged (no term-structure filter, no stop-loss)": unmanaged}
+        r = res if p is base else reuse.get(name) or run_backtest(df, p, start=args.start)
         s = risk.perf_stats(r.daily["ret"], None)
         ts = risk.trade_stats(r.trades)
         sens_rows.append({
             "Variant": name, "CAGR": pct(s["CAGR"]), "Vol": pct(s["Ann. volatility"]),
             "Sharpe": f"{s['Sharpe']:.2f}", "Max DD": pct(s["Max drawdown"]), "Worst day": pct(s["Worst day"]),
-            "Avg moneyness": pct(ts["Avg target moneyness"], 1), "% ITM": pct(ts["% expiring ITM (breached)"]),
+            "Avg moneyness": pct(ts["Avg target moneyness"], 1), "% ITM or stopped": pct(ts["% expiring ITM or stopped"]),
         })
         print(f"  ran {name}")
     sens = pd.DataFrame(sens_rows).set_index("Variant")
@@ -353,7 +370,7 @@ def main():
 
     # ---------------- next-day orders
     sig_cols = ["expiry_day", "bdays", "adj_vix_pct", "adj_vol_pct", "target_moneyness_pct", "strike",
-                "est_premium_pts", "size_mult", "notional_pct_nav", "instrument", "instrument_strike",
+                "est_premium_pts", "regime_mult", "size_mult", "notional_pct_nav", "instrument", "instrument_strike",
                 "est_premium_instr", "est_cost_instr", "contracts"]
     signals = {k: next_day_signal(df, P[k], nav=nav) for k, nav in ((args.venue, args.nav), (args.venue_inst, args.nav_inst))}
     sig_tbls = {k: s.set_index("expiry")[sig_cols].rename(columns={"adj_vix_pct": f"adj_{vol_name.lower()}_pct"})
@@ -386,6 +403,10 @@ Data: VolVue API ({und} implied vols), CBOE {V}, Yahoo ({und} OHLC), Cboe delaye
 * Held to expiry, cash-settled at the close. Each (day, expiry) tranche sells notional = NAV x {base.leverage} x size multiplier / {base.tranche_divisor:.0f},
   so at full size about {base.leverage:.0%} of NAV is outstanding on average.
 * **Low-{V} size cut:** the size multiplier is {base.cut_floor} when {V}(prev close) <= {base.cut_vol_low:.0f}, 1.0 when {V} >= {base.cut_vol_full:.0f}, linear in between.
+* **Term-structure filter:** no new sales on a day when {V}/{V}3M at the previous close is above {base.ts_threshold:.2f} (the curve is flat or
+  inverted, the usual shape before and during sell-offs).{" (Inactive: no 3-month index for " + V + ".)" if base.ts_threshold > 0 and und != "SPX" else ""}
+* **Stop-loss:** at each close, buy back any short put worth {base.stop_mult:.0f}x or more its premium, at model value plus {base.stop_cost_mult:.0f}x the normal execution cost.
+  (A stop multiple of 0 means off.) The study in [hedges.md](hedges.md) compares these rules with put-spread wings, tail puts, trend and shock filters.
 
 ## Headline risk statistics
 
@@ -395,6 +416,13 @@ Strategy Sharpe ratios are computed on option P&L, which is already an excess re
 
 ![Equity curve](equity_curve.png)
 ![Drawdown](drawdown.png)
+
+## Risk management: term-structure filter and stop-loss
+
+{md_table(mgmt_cmp)}
+
+April 2025 tariff shock (25 Mar - 8 Apr 2025): managed {pct(apr['Managed'])}, unmanaged {pct(apr['Unmanaged'])}.
+Stops were triggered {d['stops'].sum() / (len(d) / 252):.0f} times a year on average, and new sales were paused on {pct((d['regime_mult'] == 0).mean(), 0)} of days.
 
 ## Low-{V} size cut
 
@@ -488,7 +516,11 @@ Strikes are computed off the last close; recompute against the live TWAP level w
 * The model settles every option in cash at the close. SPY options are American-style and physically settled. Assignment delivers shares, which then
   carry overnight gap risk until sold. Close positions that are near the money before expiry-day close.
 * TWAP uses (O+H+L+C)/4 and interpolated IV. Intraday path, early-close days and settlement-price nuances are ignored.
-* The size-cut thresholds were chosen after looking at P&L by {V} bucket, so they are in-sample.
+* The size-cut, term-structure (0.95) and stop-loss (3x) thresholds were chosen after looking at this history, so they are in-sample.
+  hedges.md shows the effect holds in both halves of the sample (2005-15 and 2016-26).
+* The put skew is calibrated on one day's SPXW chain (2026-09-22), extended further out so hedge legs are priced realistically. That
+  calibration also lowered the modelled premium at the short strikes versus the earlier linear skew.
+* Stop-losses fill at the close at model value plus a stressed cost; a real stop in a fast market can fill worse, and overnight gaps are not protected.
 """
     (OUT / "report.md").write_text(report)
     for old in ("size_cut_cash.png", "vxn_moneyness.png"):

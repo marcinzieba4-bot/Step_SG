@@ -108,7 +108,8 @@ def trade_stats(trades: pd.DataFrame) -> dict:
         "Avg Adj. vol %": trades["adj_vol_pct"].mean() / 100,
         "Avg premium (bps of spot)": (trades["fill"] / trades["spot_twap"]).mean() * 1e4,
         "Median premium (index pts)": trades["fill"].median(),
-        "% expiring ITM (breached)": itm.mean(),
+        "% expiring ITM or stopped": itm.mean(),
+        "% stopped out (bought back)": s["stopped"].mean() if "stopped" in s else 0.0,
         "% losing trades (payoff > premium)": (s["pnl_pts"] < 0).mean(),
         "Avg loss / avg win (premium units)": (
             losers["pnl_pts"].mean() / winners["pnl_pts"].mean() if len(losers) and len(winners) else np.nan),

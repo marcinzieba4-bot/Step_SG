@@ -12,6 +12,8 @@ Strikes are set from VIX (or VXN), and implied vols come from the [VolVue](https
 * Trades are executed at an approximate full-day TWAP: Black-Scholes at `(O+H+L+C)/4` with the day's interpolated VolVue ATM IV plus a put skew calibrated on the option chains, less venue costs.
 * Positions are held to expiry and cash-settled at the close. At full size, the ladder keeps about 1x NAV of put notional outstanding.
 * **Low-VIX size cut:** size is scaled by a multiplier that is 0.25 at VIX <= 13, 1.0 at VIX >= 17, and linear in between.
+* **Term-structure filter:** no new sales while VIX/VIX3M (previous close) is above 0.95. It was 0.98-1.01 from 28 Mar 2025, ahead of the April crash.
+* **Stop-loss:** buy back any short put worth 3x its premium at the close.
 * **No interest:** returns are option P&L only. Money-market and collateral interest is off (`Params.include_cash=False`).
 
 ## Run
@@ -23,6 +25,7 @@ python -m short_put.run              # S&P 500: XSP at IBKR + SPY at GS -> outpu
 python -m short_put.run --nav 2000000 --nav-inst 250000000   # size the next-day orders
 python -m short_put.run --underlying NDX --venue ibkr_qqq --venue-inst gs_ndxp   # Nasdaq-100 version
 python -m short_put.liquidity SPX    # pre-trade check: Cboe quotes at tomorrow's strikes + spread fit
+python -m short_put.hedges           # hedge / regime study -> output/hedges.md
 ```
 
 ## Execution venues
@@ -58,6 +61,7 @@ print(next_day_signal(df, p, nav=1_000_000))   # tomorrow's three XSP strikes an
 | `short_put/risk.py` | Performance and risk statistics, VIX/VXN-regime breakdown, stress episodes, index beta |
 | `short_put/costs.py` | Venue cost models (spread fit x share paid + per-contract fees) |
 | `short_put/liquidity.py` | Cboe chain loader, quotes at tomorrow's strikes, spread calibration |
+| `short_put/hedges.py` | Study of hedges (wings, stop-losses, tail puts) and regime filters (VIX term structure, trend, shocks) |
 | `short_put/run.py` | Runs everything and writes `output/report.md`, charts and CSVs |
 
 See `output/report.md` for the latest results and the modelling caveats.

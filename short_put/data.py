@@ -31,8 +31,8 @@ UA = {"User-Agent": "Mozilla/5.0 (short-put-tracker)"}
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 
 UNDERLYINGS = {
-    "SPX": dict(name="S&P 500", yahoo="^GSPC", proxies=("SPY", "ES=F"), volvue="SPX", vol_index="VIX"),
-    "NDX": dict(name="Nasdaq-100", yahoo="^NDX", proxies=("QQQ", "NQ=F"), volvue="NDX", vol_index="VXN"),
+    "SPX": dict(name="S&P 500", yahoo="^GSPC", proxies=("SPY", "ES=F"), volvue="SPX", vol_index="VIX", vol_3m="VIX3M"),
+    "NDX": dict(name="Nasdaq-100", yahoo="^NDX", proxies=("QQQ", "NQ=F"), volvue="NDX", vol_index="VXN", vol_3m=None),
 }
 
 
@@ -68,27 +68,33 @@ def load_volvue(ticker: str, start: str = "2004-01-01", refresh: bool = False) -
 
     def _load():
         df = volvue_query(
-            "SELECT date, iv_put_10, iv_mean_10, iv_put_20, iv_mean_30, iv_skew_10, iv_skew_30 "
+            "SELECT date, iv_put_10, iv_mean_10, iv_put_20, iv_mean_30, iv_mean_90, iv_skew_10, iv_skew_30 "
             f'FROM data WHERE ticker = "{ticker}" AND date >= "{start}" ORDER BY date ASC'
         )
         df["date"] = pd.to_datetime(df["date"])
         return df.set_index("date").apply(pd.to_numeric, errors="coerce")
 
-    return _cached(f"volvue_{ticker.lower()}", _load, refresh)
+    df = _cached(f"volvue_{ticker.lower()}", _load, refresh)
+    if "iv_mean_90" not in df:  # cache written by an older version: re-download
+        df = _cached(f"volvue_{ticker.lower()}", _load, True)
+    return df
 
 
 # --------------------------------------------------------------------------- CBOE vol index
-def load_vol_index(name: str, refresh: bool = False) -> pd.Series:
-    """CBOE volatility index close (e.g. 'VIX', 'VXN')."""
+def load_vol_index(name: str, refresh: bool = False) -> pd.DataFrame:
+    """CBOE volatility index open and close (e.g. 'VIX', 'VXN', 'VIX3M')."""
 
     def _load():
         r = requests.get(CBOE_VOL_URL.format(name=name), headers=UA, timeout=60)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
         df["DATE"] = pd.to_datetime(df["DATE"], format="%m/%d/%Y")
-        return df.set_index("DATE")[["CLOSE"]].rename(columns={"CLOSE": "vol_index"})
+        return df.set_index("DATE")[["OPEN", "CLOSE"]].rename(columns={"OPEN": "open", "CLOSE": "close"})
 
-    return _cached(name.lower(), _load, refresh)["vol_index"]
+    df = _cached(name.lower(), _load, refresh)
+    if "open" not in df:  # cache written by an older version: re-download
+        df = _cached(name.lower(), _load, True)
+    return df
 
 
 # --------------------------------------------------------------------------- Yahoo
@@ -159,10 +165,14 @@ def load_all(underlying: str = "SPX", start: str = "2004-01-01", refresh: bool =
     cfg = UNDERLYINGS[underlying]
     px = load_index(underlying, start, refresh)
     vv = load_volvue(cfg["volvue"], start, refresh)
-    vol = load_vol_index(cfg["vol_index"], refresh)
+    vol = load_vol_index(cfg["vol_index"], refresh).rename(columns={"open": "vol_index_open", "close": "vol_index"})
     rf = load_tbill(start, refresh)
 
     df = px.join(vv, how="left").join(vol, how="left").join(rf.rename("rf"), how="left")
+    if cfg["vol_3m"]:
+        df = df.join(load_vol_index(cfg["vol_3m"], refresh)["close"].rename("vol_3m"), how="left")
+    else:
+        df["vol_3m"] = float("nan")
     # Gaps in the CBOE history: use VolVue 30d mean IV rescaled by the overlap
     # ratio (the vol index is a 30d variance-swap-style index on the same underlying).
     overlap = df[["vol_index", "iv_mean_30"]].dropna()
@@ -177,6 +187,14 @@ def load_all(underlying: str = "SPX", start: str = "2004-01-01", refresh: bool =
         df["iv_put_10"].fillna(df["iv_mean_10"]).fillna(df["iv_put_20"]).fillna(df["iv_mean_30"])
     )
     df[["vol_index", "rf"]] = df[["vol_index", "rf"]].ffill()
+    df["vol_index_open"] = df["vol_index_open"].fillna(df["vol_index"].shift(1))
+    # 3-month vol index (term structure). Before its CBOE history starts, proxy it
+    # with vol_index x VolVue 90d/30d mean IV, scaled on the overlap period.
+    proxy_3m = df["vol_index"] * df["iv_mean_90"] / df["iv_mean_30"]
+    ov = df[["vol_3m"]].join(proxy_3m.rename("p")).dropna()
+    if len(ov):
+        df["vol_3m"] = df["vol_3m"].fillna(proxy_3m * (ov["vol_3m"] / ov["p"]).median())
+    df["vol_3m"] = df["vol_3m"].ffill()
     # Clean bad prints (e.g. 0.15 or 157 vol near monthly expiries): if the ATM
     # vol / vol-index ratio is outside [0.45, 1.6], use vol index x rolling median ratio.
     ratio_iv = df["atm_vol"] / df["vol_index"]
